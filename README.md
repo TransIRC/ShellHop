@@ -11,10 +11,10 @@ Shellhop is a minimal, peer-assisted SSH tunneling system that helps users acces
 
 -   🛰️ **Peer-based relays** with client reachability checks
 
--   🛡️ **Authenticated gateway injection** using HMAC signatures
+-   🛡️ **Relay Authentication** ensuring only trusted relays can forward proxy protocol ips
 
 -   🧠 **Resilient design** to withstand network filtering and IP blocks
 
--   💻 **User-focused** with potential embedded SSH client support
+-   💻 **User-focused** with embedded SSH client
 
 Shellhop is built for projects like [transirc.chat](https://transirc.chat), where users need reliable, censorship-resistant access --- even from hostile networks.
