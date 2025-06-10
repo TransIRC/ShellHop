@@ -5,14 +5,25 @@ import (
         "io"
         "log"
         "net"
+        "time"
 )
 
 const (
-        ListenPort       = "50022"            // Relay listens here for client
-        GatewayAddress   = "transirc.chat:51022" // Gateway target
+        ListenPort     = "50022"             // Relay listens here for client
+        GatewayAddress = "transirc.chat:51022" // Gateway target
 )
 
 func main() {
+        // Attempt to connect to the gateway once at startup
+        log.Printf("Relay: Checking connectivity to gateway at %s", GatewayAddress)
+        conn, err := net.DialTimeout("tcp", GatewayAddress, 5*time.Second)
+        if err != nil {
+                log.Fatalf("Relay: Unable to reach gateway at startup: %v", err)
+        }
+        conn.Close()
+        log.Println("Relay: Successfully reached gateway, starting relay...")
+
+        // Start listening for clients
         listener, err := net.Listen("tcp", ":"+ListenPort)
         if err != nil {
                 log.Fatalf("Relay: Failed to listen: %v", err)
