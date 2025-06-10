@@ -8,16 +8,25 @@ ShellHop is a minimal, peer-assisted SSH tunneling system that helps users acces
 🔐 Features
 -----------
 
--   🔁 **Single-hop architecture** for simplicity and speed
+-   🔁 **Single-Hop Simplicity**\
+    Fast, efficient design that routes traffic through a single trusted relay---no complex chain hopping.
 
--   🛰️ **Peer-based relays** with client reachability checks
-  - This is currently a work-in-process. At this time the relay and gateway ips are hard coded for testing.
+-   🛰️ **Peer-Based Relay System** *(WIP)*\
+    Designed for a distributed, peer-assisted model where clients discover relays automatically.
 
--   🛡️ **Relay Authentication** using HMAC (challenge-response)
+    > ℹ️ Currently, relay and gateway IPs are hardcoded for testing. You can even connect directly via raw SSH. Dynamic relay discovery via P2P logic is planned.
 
--   🧠 **Resilient** against filtering, blocking, and censorship
+-   🛡️ **Relay Authentication via HMAC**\
+    Uses a challenge-response mechanism with HMAC to ensure only trusted relays can forward traffic.
 
--   💻 **User-friendly** with embedded SSH client logic
+-   📡 **PROXY Protocol Support**\
+    The gateway injects PROXY headers when forwarding traffic, preserving the client's original IP. This is critical for downstream services like `nickgate`, a custom SSH server that authenticates to an Ergo IRC server, preserving the IP address for bans/access control.
+
+-   🧠 **Censorship Resistance**\
+    Built to withstand IP blocks, firewalls, and deep packet inspection using trusted, volunteer-run nodes.
+
+-   💻 **User-Focused, Embedded SSH Client**\
+    Includes built-in SSH functionality, reducing user setup overhead and improving accessibility.
 
 ShellHop is purpose-built for projects like [**transirc.chat**](https://transirc.chat), where users need **censorship-resistant**, **privacy-preserving**, and **reliable** access to community services---even from hostile networks.
 
