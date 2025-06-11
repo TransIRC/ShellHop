@@ -5,41 +5,40 @@ package main
 import (
         "crypto/rand"
         "encoding/hex"
-        "flag" // Import the flag package
+        "flag"
         "fmt"
         "io/ioutil"
         "log"
+        "path/filepath"
         "strings"
 )
 
 var (
-        // The -gatewaykey flag is still useful for explicit usage,
-        // but we'll also check positional arguments.
         gatewayKeyFileFlag string
 )
 
 func init() {
-        // Define the command-line flag for explicit use
         flag.StringVar(&gatewayKeyFileFlag, "gatewaykey", "", "Path to the gateway key file to embed in the relay. If not provided, the first positional argument will be used.")
 }
 
 func main() {
-        flag.Parse() // Parse the command-line arguments
+        flag.Parse()
 
         // Determine the actual key file path
         var keyFilePath string
         if gatewayKeyFileFlag != "" {
-                // If -gatewaykey flag was explicitly used
                 keyFilePath = gatewayKeyFileFlag
         } else if len(flag.Args()) > 0 {
-                // If no -gatewaykey flag, check for a positional argument
                 keyFilePath = flag.Args()[0]
         } else {
-                // If neither flag nor positional argument, default to "relay.key"
                 keyFilePath = "relay.key"
         }
 
-        keyHex, err := ioutil.ReadFile(keyFilePath) // Use the determined key file path
+        // Extract the base name (without extension) as the key name for relay/gateway protocol
+        keyfileBase := filepath.Base(keyFilePath)
+        keyName := strings.TrimSuffix(keyfileBase, filepath.Ext(keyfileBase))
+
+        keyHex, err := ioutil.ReadFile(keyFilePath)
         if err != nil {
                 log.Fatalf("Failed to read key file %s: %v", keyFilePath, err)
         }
@@ -67,6 +66,7 @@ package main
 var (
         obfuscatedRelayKey = []byte{ %s }
         xorRelayKey        = []byte{ %s }
+        relayKeyName       = "%s"
 )
 
 func getRelayKey() []byte {
@@ -76,7 +76,11 @@ func getRelayKey() []byte {
         }
         return key
 }
-`, byteSliceToHexString(obfuscatedKey), byteSliceToHexString(xorKey))
+
+func getRelayKeyName() string {
+        return relayKeyName
+}
+`, byteSliceToHexString(obfuscatedKey), byteSliceToHexString(xorKey), keyName)
 
         if err := ioutil.WriteFile("relay_key.go", []byte(output), 0644); err != nil {
                 log.Fatalf("Failed to write relay_key.go: %v", err)

@@ -6,6 +6,7 @@ import (
         "crypto/rand"
         "crypto/sha256"
         "encoding/hex"
+        "encoding/json"
         "flag"
         "fmt"
         "io"
@@ -14,6 +15,7 @@ import (
         "os"
         "path/filepath"
         "strings"
+        "sync"
         "time"
 )
 
@@ -25,12 +27,21 @@ const (
         HMACSignatureSize  = sha256.Size * 2 // SHA256 in hex (2 hex chars per byte)
         KeysDirectory      = "keys" // The fixed directory for keys
         HealthCheckMessage = "HEALTHCHECK\n" // New: Health check message
+        PeerMapFileName    = "peer_map.json" // Peer map file in same dir as gateway binary
+        PeerTimeout        = 10 * time.Minute // Timeout for relay peer entries
 )
 
 var (
         keygenName string // This will hold the name provided after -keygen
-        loadedKeys [][]byte // Slice to hold all loaded secret keys
+        loadedKeys map[string][]byte // keyname -> key bytes
+
+        peerMap     = make(map[string]int64) // map[ip]=lastSeenUnix
+        peerMapLock sync.Mutex
+        peerMapPath string
 )
+
+// PeerMapData is for saving/loading peer_map.json
+type PeerMapData map[string]int64
 
 func init() {
         flag.StringVar(&keygenName, "keygen", "", "Generate a new random key and store it as <value>.key in the 'keys/' directory.")
@@ -38,6 +49,14 @@ func init() {
 
 func main() {
         flag.Parse()
+
+        // Determine peer_map.json path (same dir as the gateway binary)
+        exePath, err := os.Executable()
+        if err != nil {
+                log.Fatalf("Gateway: Failed to determine executable path: %v", err)
+        }
+        exeDir := filepath.Dir(exePath)
+        peerMapPath = filepath.Join(exeDir, PeerMapFileName)
 
         if keygenName != "" {
                 if !strings.HasSuffix(keygenName, ".key") {
@@ -51,10 +70,10 @@ func main() {
                 return
         }
 
-        var err error
-        loadedKeys, err = loadAllKeysFromDir(KeysDirectory)
-        if err != nil {
-                log.Fatalf("Gateway: Error loading keys from '%s' directory: %v", KeysDirectory, err)
+        var loadErr error
+        loadedKeys, loadErr = loadAllKeysFromDir(KeysDirectory)
+        if loadErr != nil {
+                log.Fatalf("Gateway: Error loading keys from '%s' directory: %v", KeysDirectory, loadErr)
         }
 
         if len(loadedKeys) == 0 {
@@ -62,6 +81,14 @@ func main() {
                         "Please generate at least one key by running: './gateway -keygen <your_key_name>'", KeysDirectory)
         }
         log.Printf("Gateway: Loaded %d secret key(s) from '%s/' directory.", len(loadedKeys), KeysDirectory)
+
+        // Load existing peer map from file (if exists)
+        if err := loadPeerMap(); err != nil {
+                log.Printf("Gateway: Warning: Failed to load peer map: %v (continuing with empty map)", err)
+        }
+
+        // Start goroutine for cleaning peers
+        go peerMapCleaner()
 
         listener, err := net.Listen("tcp", ":"+GatewayListenPort)
         if err != nil {
@@ -95,30 +122,32 @@ func generateAndSaveKey(fullPath string) error {
         return os.WriteFile(fullPath, []byte(hex.EncodeToString(key)), 0600)
 }
 
-// loadAllKeysFromDir reads all files in the specified directory,
-// attempts to decode them as hex-encoded keys, and returns a slice of valid keys.
-func loadAllKeysFromDir(dir string) ([][]byte, error) {
-        var keys [][]byte
+// loadAllKeysFromDir returns map of keyname (filename without .key) to key bytes
+func loadAllKeysFromDir(dir string) (map[string][]byte, error) {
+        keys := make(map[string][]byte)
 
-        // Create the directory if it doesn't exist, ignore if it does
         if err := os.MkdirAll(dir, 0700); err != nil {
                 return nil, fmt.Errorf("could not create key directory %s: %w", dir, err)
         }
 
         files, err := os.ReadDir(dir)
         if err != nil {
-                // If directory doesn't exist, treat as no keys found, not a fatal error here
                 if os.IsNotExist(err) {
-                        return nil, nil
+                        return keys, nil
                 }
                 return nil, fmt.Errorf("failed to read key directory %s: %w", dir, err)
         }
 
         for _, file := range files {
                 if file.IsDir() {
-                        continue // Skip subdirectories
+                        continue
                 }
-                filePath := filepath.Join(dir, file.Name())
+                name := file.Name()
+                if !strings.HasSuffix(name, ".key") {
+                        continue
+                }
+                keyname := strings.TrimSuffix(name, ".key")
+                filePath := filepath.Join(dir, name)
                 keyBytes, err := os.ReadFile(filePath)
                 if err != nil {
                         log.Printf("Gateway: Warning: Failed to read key file %s: %v", filePath, err)
@@ -133,23 +162,91 @@ func loadAllKeysFromDir(dir string) ([][]byte, error) {
                         log.Printf("Gateway: Warning: Invalid key length in file %s: expected 32 bytes, got %d", filePath, len(decodedKey))
                         continue
                 }
-                keys = append(keys, decodedKey)
-                log.Printf("Gateway: Loaded key: %s", filePath) // Log successful key load
+                keys[keyname] = decodedKey
+                log.Printf("Gateway: Loaded key: %s as %s", filePath, keyname)
         }
         return keys, nil
 }
 
-// verifyHMACAgainstAny checks if the provided signature is valid against any of the given keys.
-func verifyHMACAgainstAny(keys [][]byte, data []byte, signature string) bool {
-        for _, k := range keys {
-                h := hmac.New(sha256.New, k)
-                h.Write(data)
-                expectedMAC := hex.EncodeToString(h.Sum(nil))
-                if hmac.Equal([]byte(signature), []byte(expectedMAC)) {
-                        return true // Authentication successful with this key
+func verifyHMACAgainstKey(key []byte, data []byte, signature string) bool {
+        h := hmac.New(sha256.New, key)
+        h.Write(data)
+        expectedMAC := hex.EncodeToString(h.Sum(nil))
+        return hmac.Equal([]byte(signature), []byte(expectedMAC))
+}
+
+// Save peerMap to peer_map.json
+func savePeerMap() error {
+        peerMapLock.Lock()
+        defer peerMapLock.Unlock()
+        f, err := os.Create(peerMapPath)
+        if err != nil {
+                return err
+        }
+        defer f.Close()
+        enc := json.NewEncoder(f)
+        return enc.Encode(peerMap)
+}
+
+// Load peerMap from peer_map.json
+func loadPeerMap() error {
+        peerMapLock.Lock()
+        defer peerMapLock.Unlock()
+        data, err := os.ReadFile(peerMapPath)
+        if err != nil {
+                if os.IsNotExist(err) {
+                        return nil // no file, ignore
+                }
+                return err
+        }
+        return json.Unmarshal(data, &peerMap)
+}
+
+// Periodically remove old peers and save peer_map.json
+func peerMapCleaner() {
+        for {
+                time.Sleep(1 * time.Minute)
+                now := time.Now().Unix()
+                changed := false
+
+                peerMapLock.Lock()
+                for ip, lastSeen := range peerMap {
+                        if now-lastSeen > int64(PeerTimeout.Seconds()) {
+                                delete(peerMap, ip)
+                                changed = true
+                        }
+                }
+                peerMapLock.Unlock()
+                if changed {
+                        if err := savePeerMap(); err != nil {
+                                log.Printf("Gateway: Error saving peer map during cleanup: %v", err)
+                        }
                 }
         }
-        return false // No key matched the HMAC
+}
+
+// Get relay's remote IP as string (without port)
+func remoteIPOnly(addr net.Addr) string {
+        host, _, err := net.SplitHostPort(addr.String())
+        if err != nil {
+                return addr.String()
+        }
+        return host
+}
+
+// Marshal peerMap to JSON for hmac sending
+func marshalPeerMapJSON() ([]byte, error) {
+        peerMapLock.Lock()
+        defer peerMapLock.Unlock()
+        return json.Marshal(peerMap)
+}
+
+func xorObfuscate(data, key []byte) []byte {
+        obfuscated := make([]byte, len(data))
+        for i := 0; i < len(data); i++ {
+                obfuscated[i] = data[i] ^ key[i%len(key)]
+        }
+        return obfuscated
 }
 
 func handleRelay(relayConn net.Conn) {
@@ -157,28 +254,73 @@ func handleRelay(relayConn net.Conn) {
 
         relayReader := bufio.NewReader(relayConn)
 
-        // First, try to read a potential health check message without a deadline
-        // or with a very short one to avoid blocking.
-        // We'll set a short deadline here to quickly determine if it's a health check
-        // or a regular connection attempting HMAC.
-        relayConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) // Very short timeout for health check
+        // Read relay ID first
+        relayConn.SetReadDeadline(time.Now().Add(ReadTimeout))
+        relayIDLine, err := relayReader.ReadString('\n')
+        if err != nil {
+                log.Printf("Gateway: Failed to read relay ID from %s: %v", relayConn.RemoteAddr(), err)
+                return
+        }
+        relayConn.SetReadDeadline(time.Time{})
+
+        relayIDLine = strings.TrimSpace(relayIDLine)
+        if !strings.HasPrefix(relayIDLine, "RELAYID ") {
+                log.Printf("Gateway: Missing RELAYID header from %s: %q", relayConn.RemoteAddr(), relayIDLine)
+                return
+        }
+        relayKeyName := strings.TrimSpace(strings.TrimPrefix(relayIDLine, "RELAYID "))
+
+        relayKey, ok := loadedKeys[relayKeyName]
+        if !ok {
+                log.Printf("Gateway: Unknown relay key name '%s' from %s", relayKeyName, relayConn.RemoteAddr())
+                return
+        }
+
+        // Peek to see if this is a health check
+        relayConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
         peekedBytes, err := relayReader.Peek(len(HealthCheckMessage))
-        relayConn.SetReadDeadline(time.Time{}) // Clear deadline
+        relayConn.SetReadDeadline(time.Time{})
 
         if err == nil && string(peekedBytes) == HealthCheckMessage {
-                // It's a health check! Read the message fully and respond.
-                _, _ = relayReader.ReadString('\n') // Consume the health check message
-                log.Printf("Gateway: Received health check from %s. Responding with 'OK'.", relayConn.RemoteAddr())
+                // Health Check
+                _, _ = relayReader.ReadString('\n')
+                relayIP := remoteIPOnly(relayConn.RemoteAddr())
+
+                // Update peer map
+                now := time.Now().Unix()
+                peerMapLock.Lock()
+                peerMap[relayIP] = now
+                peerMapLock.Unlock()
+                if err := savePeerMap(); err != nil {
+                        log.Printf("Gateway: Failed to save peer map after health check: %v", err)
+                }
+
+                peerMapJSON, err := marshalPeerMapJSON()
+                if err != nil {
+                        log.Printf("Gateway: Failed to marshal peer map JSON: %v", err)
+                        relayConn.Write([]byte("ERROR\n"))
+                        return
+                }
+
+                obfuscated := xorObfuscate(peerMapJSON, relayKey)
+                obfHex := hex.EncodeToString(obfuscated)
+                h := hmac.New(sha256.New, relayKey)
+                h.Write(obfuscated)
+                hmacSig := hex.EncodeToString(h.Sum(nil))
+
                 relayConn.SetWriteDeadline(time.Now().Add(ReadTimeout))
-                _, writeErr := relayConn.Write([]byte("OK\n"))
+                _, writeErr := relayConn.Write([]byte(fmt.Sprintf("OK\n%s\n%s\n", obfHex, hmacSig)))
                 relayConn.SetWriteDeadline(time.Time{})
                 if writeErr != nil {
                         log.Printf("Gateway: Failed to send health check response to %s: %v", relayConn.RemoteAddr(), writeErr)
+                } else {
+                        log.Printf("Gateway: Sent obfuscated peer map to relay %s (health check, key %s)", relayIP, relayKeyName)
                 }
-                return // Health check handled, close connection
+                return
         }
 
-        // If it's not a health check, proceed with HMAC authentication.
+        // Not a health check, proceed with HMAC authentication
+
         // 1. Send challenge
         challenge := make([]byte, HMACChallengeSize)
         if _, err := rand.Read(challenge); err != nil {
@@ -210,18 +352,16 @@ func handleRelay(relayConn net.Conn) {
         receivedChallengeHex := parts[0]
         receivedHMACSignature := parts[1]
 
-        // Verify the received challenge matches the sent challenge
         if receivedChallengeHex != hex.EncodeToString(challenge) {
                 log.Printf("Gateway: Challenge mismatch from %s. Expected %s, Got %s", relayConn.RemoteAddr(), hex.EncodeToString(challenge), receivedChallengeHex)
                 return
         }
 
-        // 3. Verify HMAC against any loaded key
-        if !verifyHMACAgainstAny(loadedKeys, challenge, receivedHMACSignature) {
-                log.Printf("Gateway: Invalid HMAC signature from %s", relayConn.RemoteAddr())
+        if !verifyHMACAgainstKey(relayKey, challenge, receivedHMACSignature) {
+                log.Printf("Gateway: Invalid HMAC signature from %s (relay key: %s)", relayConn.RemoteAddr(), relayKeyName)
                 return
         }
-        log.Printf("Gateway: Successfully authenticated relay from %s", relayConn.RemoteAddr())
+        log.Printf("Gateway: Successfully authenticated relay from %s using key %s", relayConn.RemoteAddr(), relayKeyName)
 
         // 4. Read proxy line
         relayConn.SetReadDeadline(time.Now().Add(ReadTimeout))
